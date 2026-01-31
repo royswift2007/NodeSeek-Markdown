@@ -1,0 +1,778 @@
+/**********************
+ * 基础工具
+ **********************/
+
+function isProbablyUrl(u) {
+  try {
+    const url = new URL(u);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function clampLen(s, max) {
+  s = String(s || "");
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+function mdEscapeInline(s) {
+  return String(s || "").replace(/`/g, "\\`");
+}
+
+function mdEscapeAlt(s) {
+  return mdEscapeInline(s)
+    .replace(/\]/g, "\\]")
+    .replace(/\r?\n+/g, " ")
+    .trim();
+}
+
+/**********************
+ * 文本清洗 / 分句 / 分段（修正版）
+ **********************/
+
+function normalizeText(raw) {
+  let t = String(raw || "").replace(/\r\n/g, "\n");
+  t = t
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/g, ""))
+    .join("\n");
+  t = t.replace(/[ \t]{2,}/g, " ");
+  return t.trim();
+}
+
+function splitSentences(raw) {
+  // 对中文更友好，避免误切 URL/版本号/小数点
+  const text = String(raw || "").trim();
+  if (!text) return [];
+
+  const out = [];
+  let buf = "";
+
+  const isUrlContext = (s) => {
+    return /(https?:\/\/|www\.)/i.test(s) || /[a-z0-9-]+\.[a-z]{2,}/i.test(s);
+  };
+
+  const isNumberDot = (p, n) => /[0-9]/.test(p || "") && /[0-9]/.test(n || "");
+
+  const chars = [...text];
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    const prev = chars[i - 1];
+    const next = chars[i + 1];
+
+    buf += ch;
+
+    // 省略号：... 或 ……
+    if (ch === "." && chars[i + 1] === "." && chars[i + 2] === ".") {
+      buf += "..";
+      i += 2;
+      out.push(buf.trim());
+      buf = "";
+      continue;
+    }
+    if (ch === "…" && chars[i + 1] === "…") {
+      buf += "…";
+      i += 1;
+      out.push(buf.trim());
+      buf = "";
+      continue;
+    }
+
+    // 强句末
+    if (ch === "。" || ch === "！" || ch === "？" || ch === "!" || ch === "?") {
+      out.push(buf.trim());
+      buf = "";
+      continue;
+    }
+
+    // 英文句号：避免在 1.2 / v1.2.3 / example.com 切分
+    if (ch === ".") {
+      if (isNumberDot(prev, next)) continue;
+      if (isUrlContext(buf)) continue;
+      if (/[a-z]/i.test(next || "")) continue;
+      out.push(buf.trim());
+      buf = "";
+      continue;
+    }
+
+    // 分号作为弱句末
+    if (ch === "；" || ch === ";") {
+      out.push(buf.trim());
+      buf = "";
+      continue;
+    }
+  }
+
+  if (buf.trim()) out.push(buf.trim());
+  return out.filter(Boolean);
+}
+
+function formatIntoParagraphs(raw, sentencesPerPara) {
+  const t = normalizeText(raw);
+  if (!t) return "";
+
+  // 若已有空行 → 尊重用户段落；段内合并硬换行
+  if (/\n\s*\n/.test(t)) {
+    return t
+      .split(/\n\s*\n+/)
+      .map((p) => p.replace(/\n+/g, " ").trim())
+      .filter(Boolean)
+      .join("\n\n");
+  }
+
+  // 无空行 → 自动分句并组段
+  const sents = splitSentences(t);
+
+  // 兜底：逗号弱切，避免整篇“一坨”
+  if (sents.length <= 1 && t.length > 120) {
+    const weak = t.split(/[，,]/).map((x) => x.trim()).filter(Boolean);
+    const out = [];
+    for (let i = 0; i < weak.length; i += 3) {
+      out.push(weak.slice(i, i + 3).join("，"));
+    }
+    return out.join("\n\n");
+  }
+
+  const n = Math.max(1, Math.min(5, parseInt(sentencesPerPara, 10) || 2));
+  const paras = [];
+  for (let i = 0; i < sents.length; i += n) {
+    paras.push(sents.slice(i, i + n).join(" "));
+  }
+  return paras.join("\n\n");
+}
+
+/**********************
+ * 列表 / 小标题
+ **********************/
+
+function toBulletList(raw, mode, sentencesPerItem) {
+  // mode: "lines" | "sentences"
+  const t = normalizeText(raw);
+  if (!t) return "";
+
+  if (mode === "lines") {
+    const items = t
+      .split("\n")
+      .map((x) => x.trim())
+      .filter(Boolean)
+      .map((x) => x.replace(/^[-*•]\s+/, "").replace(/^\d+[\.\)]\s+/, ""));
+    return items.map((x) => "- " + x).join("\n");
+  }
+
+  const sents = splitSentences(t);
+  const n = Math.max(1, Math.min(5, parseInt(sentencesPerItem, 10) || 1));
+  const items = [];
+  for (let i = 0; i < sents.length; i += n) {
+    items.push(sents.slice(i, i + n).join(" "));
+  }
+  return items.map((x) => "- " + x).join("\n");
+}
+
+function parseSections(raw) {
+  // 识别：
+  // 1) 1. 标题 / 1) 标题
+  // 2) 标题：内容
+  // ✅ 修复：遇到 https:// 这种不要把 https: 当成标题
+  const t = normalizeText(raw);
+  if (!t) return [];
+
+  const lines = t.split("\n").map((x) => x.trim()).filter(Boolean);
+
+  const hasNumHead = lines.some((l) => /^\d+[\.\)]\s+/.test(l));
+  const sections = [];
+
+  if (hasNumHead) {
+    let current = null;
+    for (const line of lines) {
+      const m = line.match(/^(\d+)[\.\)]\s+(.*)$/);
+      if (m) {
+        if (current) sections.push(current);
+        current = { title: m[2].trim(), body: "" };
+      } else if (current) {
+        current.body += (current.body ? "\n" : "") + line;
+      } else {
+        sections.push({ title: "", body: line });
+      }
+    }
+    if (current) sections.push(current);
+    return sections;
+  }
+
+  let current = { title: "", body: "" };
+
+  for (const line of lines) {
+    // ✅ 关键：包含 "://" 的直接视为内容行
+    if (line.includes("://")) {
+      current.body += (current.body ? "\n" : "") + line;
+      continue;
+    }
+
+    const m = line.match(/^(.{1,24})[：:]\s*(.*)$/);
+    if (m) {
+      // 再保险：避免 http/https/ftp/file: //xxx 被当标题
+      const head = (m[1] || "").trim().toLowerCase();
+      const tail = (m[2] || "").trim();
+      const looksLikeScheme =
+        (head === "http" || head === "https" || head === "ftp" || head === "file") && tail.startsWith("//");
+      if (looksLikeScheme) {
+        current.body += (current.body ? "\n" : "") + line;
+        continue;
+      }
+
+      if (current.title || current.body) sections.push(current);
+      current = { title: m[1].trim(), body: m[2].trim() };
+    } else {
+      current.body += (current.body ? "\n" : "") + line;
+    }
+  }
+
+  if (current.title || current.body) sections.push(current);
+  return sections;
+}
+
+function renderSections(sections, bodyStyle, paraN, listMode, listN) {
+  // bodyStyle: "paragraphs" | "list"
+  const out = [];
+  for (const s of sections) {
+    if (s.title) out.push("### " + mdEscapeInline(s.title));
+    const body = s.body || "";
+    if (bodyStyle === "list") {
+      out.push(toBulletList(body, listMode, listN));
+    } else {
+      out.push(formatIntoParagraphs(body, paraN));
+    }
+    out.push("");
+  }
+  return out.join("\n").trim();
+}
+
+/**********************
+ * ✅ 强调标记（替代颜色）应用到格式化结果
+ * 规则：不改小标题（###），对段落首行/列表项加 emoji
+ **********************/
+
+function applyEmojiToFormattedMarkdown(formatted, emoji) {
+  const em = String(emoji || "").trim();
+  if (!em) return formatted;
+
+  const lines = String(formatted || "").split("\n");
+  let startOfBlock = true;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (!line.trim()) {
+      startOfBlock = true;
+      continue;
+    }
+
+    // 不动小标题
+    if (line.startsWith("### ")) {
+      startOfBlock = true; // 标题后下一行也视作块起始
+      continue;
+    }
+
+    // 列表项：- item → - 🟢 item
+    if (line.startsWith("- ")) {
+      const rest = line.slice(2).trim();
+      // 防重复
+      if (!rest.startsWith(em + " ")) {
+        lines[i] = "- " + em + " " + rest;
+      }
+      startOfBlock = false;
+      continue;
+    }
+
+    // 段落：只在段落首行加
+    if (startOfBlock) {
+      if (!line.startsWith(em + " ")) {
+        lines[i] = em + " " + line;
+      }
+      startOfBlock = false;
+    }
+  }
+
+  return lines.join("\n");
+}
+
+/**********************
+ * Markdown 输出（图片 / 文字）
+ **********************/
+
+function makeMdText(text, opt) {
+  let t = String(text || "").trim();
+  if (!t) return "";
+
+  t = mdEscapeInline(t);
+
+  if (opt.strike) t = "~~" + t + "~~";
+  if (opt.bold) t = "**" + t + "**";
+  if (opt.prefixEmoji) t = opt.prefixEmoji + " " + t;
+
+  if (opt.quote) {
+    t = t
+      .split("\n")
+      .map((line) => (line.trim() ? "> " + line : ">"))
+      .join("\n");
+  }
+
+  return t;
+}
+
+function makeMdImage(url, alt) {
+  const a = mdEscapeAlt(alt || "image");
+  return "![" + (a || "image") + "](" + url + ")";
+}
+
+/**********************
+ * 页面（文本格式化面板加入强调标记）
+ * 注意：脚本里不使用反引号，避免嵌套导致 SyntaxError
+ **********************/
+
+const PAGE = () => `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>NodeSeek Markdown 工具</title>
+<style>
+  :root{
+    --bg:#0f172a;--panel:#111827;--border:#1f2937;--input:#020617;
+    --text:#e5e7eb;--muted:#9ca3af;--accent:#38bdf8;--radius:12px;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;background:var(--bg);color:var(--text);
+    font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;
+    line-height:1.55;
+  }
+  .wrap{max-width:980px;margin:0 auto;padding:40px 16px 80px}
+  h1{margin:0 0 6px;font-size:28px;letter-spacing:.2px}
+  .sub{color:var(--muted);font-size:14px}
+  .panel{
+    background:var(--panel);border:1px solid var(--border);
+    border-radius:var(--radius);padding:20px;margin-top:14px;
+  }
+  .titleRow{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}
+  .titleRow h2{margin:0;font-size:16px;color:rgba(229,231,235,.95)}
+  .tag{font-size:12px;color:var(--muted)}
+  label{display:block;font-size:13px;color:var(--muted);margin:10px 0 6px}
+  input,textarea,select,button,pre{
+    width:100%;background:var(--input);color:var(--text);
+    border:1px solid var(--border);border-radius:10px;
+    padding:10px 12px;font-size:14px;
+  }
+  textarea{min-height:160px;resize:vertical}
+  input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent)}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+  .btn{
+    margin-top:12px;background:var(--accent);color:#020617;
+    font-weight:700;border:none;cursor:pointer;
+    transition:transform .08s ease,opacity .08s;
+  }
+  .btn:hover{opacity:.92}
+  .btn:active{transform:translateY(1px)}
+  .result{display:none;margin-top:14px}
+  pre{
+    background:#020617;white-space:pre-wrap;word-break:break-word;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;
+  }
+  .actions{display:flex;gap:10px;margin-top:10px;flex-wrap:wrap}
+  .actions button{width:auto;cursor:pointer}
+  .actions button:hover{border-color:var(--accent)}
+  img.preview{margin-top:14px;max-width:100%;border-radius:10px;border:1px solid var(--border)}
+  .hint{margin-top:6px;font-size:12px;color:var(--muted)}
+  footer{margin-top:28px;text-align:center;color:var(--muted);font-size:12px}
+  .toast{
+    position:fixed;right:16px;bottom:16px;background:#020617;border:1px solid var(--border);
+    padding:10px 14px;border-radius:10px;font-size:13px;opacity:0;transform:translateY(10px);
+    transition:all .2s ease;pointer-events:none;
+  }
+  .toast.show{opacity:1;transform:translateY(0)}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>NodeSeek Markdown 工具</h1>
+    <div class="sub">纯 Markdown · 不使用 HTML · 图片代码 + 文本段落/列表/小标题</div>
+    <div class="sub">🔴 Cloudflare Workers Free每天只有10万请求 . 节省点用哈</div>
+    
+    <div class="panel">
+      <div class="titleRow">
+        <h2>图片 → Markdown</h2>
+        <div class="tag">/api/convert</div>
+      </div>
+
+      <label>图片 URL（可空）</label>
+      <input id="url" placeholder="https://example.com/image.png" />
+
+      <div class="grid">
+        <div>
+          <label>图片 alt（可空）</label>
+          <input id="alt" placeholder="测速截图 / 方案示意图" />
+        </div>
+        <div>
+          <label>强调标记（替代颜色）</label>
+          <select id="emoji">
+            <option value="">无</option>
+            <option value="🟢">🟢 推荐 / 正向</option>
+            <option value="🟡">🟡 注意 / 提示</option>
+            <option value="🔴">🔴 警告 / 避雷</option>
+            <option value="⚡">⚡ 重点</option>
+          </select>
+        </div>
+      </div>
+
+      <label>说明文字（可选，可粘贴段落）</label>
+      <textarea id="text" placeholder="你可以先在下面“文本格式化”整理好段落，再粘贴到这里一起输出。"></textarea>
+
+      <div class="grid3">
+        <div>
+          <label>加粗</label>
+          <select id="bold">
+            <option value="no">否</option>
+            <option value="yes">是</option>
+          </select>
+        </div>
+        <div>
+          <label>删除线</label>
+          <select id="strike">
+            <option value="no">否</option>
+            <option value="yes">是</option>
+          </select>
+        </div>
+        <div>
+          <label>引用块</label>
+          <select id="quote">
+            <option value="no">否</option>
+            <option value="yes">是（每行加 >）</option>
+          </select>
+        </div>
+      </div>
+
+      <button class="btn" id="btnGen">生成 Markdown</button>
+      <div class="hint">说明：NodeSeek 不支持 HTML 时，无法变色/控大小/对齐；这里用 emoji 替代颜色。图片 URL 留空则只输出文字。</div>
+
+      <div class="result" id="genResult">
+        <pre id="genOut"></pre>
+        <div class="actions">
+          <button id="genCopy">复制</button>
+          <button id="genClear">清空</button>
+        </div>
+        <img class="preview" id="preview" style="display:none" />
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="titleRow">
+        <h2>文本格式化：段落 / 列表 / 小标题</h2>
+        <div class="tag">/api/format</div>
+      </div>
+
+      <label>粘贴原始文字</label>
+      <textarea id="raw" placeholder="支持识别：&#10;1) 标题 / 1. 标题&#10;以及：标题：内容&#10;若原文有空行，会保留段落；否则自动按句末标点分句再组段。"></textarea>
+
+      <div class="grid">
+        <div>
+          <label>格式化模式</label>
+          <select id="fmtMode">
+            <option value="paragraphs">段落</option>
+            <option value="list_lines">列表（按行）</option>
+            <option value="list_sentences">列表（按句）</option>
+            <option value="h_paragraphs">小标题 + 段落</option>
+            <option value="h_list">小标题 + 列表</option>
+          </select>
+        </div>
+        <div>
+          <label>输出为引用块</label>
+          <select id="fmtQuote">
+            <option value="no">否</option>
+            <option value="yes">是（每行加 >）</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid3">
+        <div>
+          <label>段落：每段句子数</label>
+          <select id="paraN">
+            <option value="1">1</option>
+            <option value="2" selected>2（推荐）</option>
+            <option value="3">3</option>
+          </select>
+        </div>
+        <div>
+          <label>列表（按句）：每条句子数</label>
+          <select id="listN">
+            <option value="1" selected>1</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+          </select>
+        </div>
+        <div>
+          <label>标题块下：列表方式</label>
+          <select id="listMode">
+            <option value="lines" selected>按行</option>
+            <option value="sentences">按句</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div>
+          <label>强调标记（替代颜色）</label>
+          <select id="fmtEmoji">
+            <option value="">无</option>
+            <option value="🟢">🟢 推荐 / 正向</option>
+            <option value="🟡">🟡 注意 / 提示</option>
+            <option value="🔴">🔴 警告 / 避雷</option>
+            <option value="⚡">⚡ 重点</option>
+          </select>
+        </div>
+        <div></div>
+      </div>
+
+      <button class="btn" id="btnFmt">格式化输出</button>
+
+      <div class="result" id="fmtResult">
+        <pre id="fmtOut"></pre>
+        <div class="actions">
+          <button id="fmtCopy">复制</button>
+          <button id="fmtClear">清空</button>
+        </div>
+      </div>
+    </div>
+
+    <footer>本工具仅生成 Markdown 文本，不存储、不代理、不分发图片资源</footer>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+<script>
+  function $(id){ return document.getElementById(id); }
+  var toast = $("toast");
+  function showToast(msg){
+    toast.textContent = msg;
+    toast.classList.add("show");
+    setTimeout(function(){ toast.classList.remove("show"); }, 1800);
+  }
+
+  $("btnGen").onclick = async function(){
+    var payload = {
+      url: $("url").value.trim(),
+      alt: $("alt").value.trim(),
+      text: $("text").value,
+      emoji: $("emoji").value,
+      bold: $("bold").value === "yes",
+      strike: $("strike").value === "yes",
+      quote: $("quote").value === "yes"
+    };
+
+    var res = await fetch("/api/convert", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    var data = await res.json();
+    if (!res.ok) { showToast(data.error || "生成失败"); return; }
+
+    $("genOut").textContent = data.output || "";
+    $("genResult").style.display = "block";
+
+    if (data.url) {
+      $("preview").src = data.url;
+      $("preview").style.display = "block";
+    } else {
+      $("preview").style.display = "none";
+    }
+
+    showToast("已生成 Markdown");
+  };
+
+  $("genCopy").onclick = async function(){
+    try { await navigator.clipboard.writeText($("genOut").textContent); showToast("已复制"); }
+    catch(e){ showToast("复制失败（浏览器限制）"); }
+  };
+
+  $("genClear").onclick = function(){
+    $("url").value = "";
+    $("alt").value = "";
+    $("text").value = "";
+    $("emoji").value = "";
+    $("bold").value = "no";
+    $("strike").value = "no";
+    $("quote").value = "no";
+    $("genResult").style.display = "none";
+    $("preview").style.display = "none";
+    showToast("已清空");
+  };
+
+  $("btnFmt").onclick = async function(){
+    var payload = {
+      raw: $("raw").value,
+      fmtMode: $("fmtMode").value,
+      paraN: $("paraN").value,
+      listN: $("listN").value,
+      listMode: $("listMode").value,
+      emoji: $("fmtEmoji").value,
+      quote: $("fmtQuote").value === "yes"
+    };
+
+    var res = await fetch("/api/format", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    var data = await res.json();
+    if (!res.ok) { showToast(data.error || "格式化失败"); return; }
+
+    $("fmtOut").textContent = data.formatted || "";
+    $("fmtResult").style.display = "block";
+    showToast("已格式化");
+  };
+
+  $("fmtCopy").onclick = async function(){
+    try { await navigator.clipboard.writeText($("fmtOut").textContent); showToast("已复制"); }
+    catch(e){ showToast("复制失败（浏览器限制）"); }
+  };
+
+  $("fmtClear").onclick = function(){
+    $("raw").value = "";
+    $("fmtResult").style.display = "none";
+    showToast("已清空");
+  };
+</script>
+</body>
+</html>`;
+
+/**********************
+ * Worker 路由
+ **********************/
+
+addEventListener("fetch", (event) => {
+  event.respondWith(handle(event.request));
+});
+
+async function handle(request) {
+  const url = new URL(request.url);
+
+  // 首页
+  if (request.method === "GET" && url.pathname === "/") {
+    return new Response(PAGE(), {
+      headers: { "content-type": "text/html; charset=utf-8" },
+    });
+  }
+
+  // 图片 → Markdown
+  if (url.pathname === "/api/convert" && request.method === "POST") {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ error: "请求体必须是 JSON" }, 400);
+    }
+
+    // ✅ 允许图片 URL 为空：为空时仅输出文字
+    const imgUrl = String(body?.url || "").trim();
+    const alt = clampLen(String(body?.alt || "").trim(), 200);
+    const text = clampLen(String(body?.text || ""), 8000);
+
+    const emoji = clampLen(String(body?.emoji || "").trim(), 4);
+    const bold = !!body?.bold;
+    const strike = !!body?.strike;
+    const quote = !!body?.quote;
+
+    const textPart = makeMdText(text, {
+      bold,
+      strike,
+      prefixEmoji: emoji,
+      quote,
+    });
+
+    // 两者都空才报错
+    if (!imgUrl && !textPart) {
+      return json({ error: "图片 URL 和说明文字至少填写一个" }, 400);
+    }
+
+    // 只有填了 URL 才校验 URL
+    if (imgUrl) {
+      if (!isProbablyUrl(imgUrl)) return json({ error: "请输入有效的 http/https 图片链接" }, 400);
+      if (imgUrl.length > 2000) return json({ error: "链接太长了" }, 400);
+    }
+
+    let output = "";
+    if (textPart) output += textPart;
+
+    if (imgUrl) {
+      const imgPart = makeMdImage(imgUrl, alt || "image");
+      output += (output ? "\n\n" : "") + imgPart;
+    }
+
+    return json({ url: imgUrl || "", output }, 200);
+  }
+
+  // 文本格式化
+  if (url.pathname === "/api/format" && request.method === "POST") {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ error: "请求体必须是 JSON" }, 400);
+    }
+
+    const raw = clampLen(String(body?.raw || ""), 30000);
+    const fmtMode = String(body?.fmtMode || "paragraphs");
+    const paraN = String(body?.paraN || "2");
+    const listN = String(body?.listN || "1");
+    const listMode = String(body?.listMode || "lines");
+    const emoji = clampLen(String(body?.emoji || "").trim(), 4);
+    const quote = !!body?.quote;
+
+    if (!raw.trim()) return json({ error: "请粘贴要格式化的文字" }, 400);
+
+    let formatted = "";
+
+    if (fmtMode === "paragraphs") {
+      formatted = formatIntoParagraphs(raw, paraN);
+    } else if (fmtMode === "list_lines") {
+      formatted = toBulletList(raw, "lines", listN);
+    } else if (fmtMode === "list_sentences") {
+      formatted = toBulletList(raw, "sentences", listN);
+    } else if (fmtMode === "h_paragraphs") {
+      formatted = renderSections(parseSections(raw), "paragraphs", paraN, listMode, listN);
+    } else if (fmtMode === "h_list") {
+      formatted = renderSections(parseSections(raw), "list", paraN, listMode, listN);
+    } else {
+      formatted = formatIntoParagraphs(raw, paraN);
+    }
+
+    // ✅ 强调标记（替代颜色）
+    formatted = applyEmojiToFormattedMarkdown(formatted, emoji);
+
+    // 引用块最后再做（避免影响 emoji 注入判断）
+    if (quote) {
+      formatted = formatted
+        .split("\n")
+        .map((line) => (line.trim() ? "> " + line : ">"))
+        .join("\n");
+    }
+
+    return json({ formatted }, 200);
+  }
+
+  return new Response("Not Found", {
+    status: 404,
+    headers: { "content-type": "text/plain; charset=utf-8" },
+  });
+}
+
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
